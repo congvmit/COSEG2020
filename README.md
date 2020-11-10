@@ -1,0 +1,5 @@
+# COSEGCha
+
+## Training
+
+`./train.sh`
