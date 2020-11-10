@@ -16,6 +16,15 @@ __December 10th, 2020 (11:59PM GMT): Deadline for submission of test results and
 
 December 2020 (TBD): Ranking of results will be available.
 
+
+## Installation
+
+Follow the instruction here: https://docs.monai.io/en/latest/installation.html
+
+```
+pip install git+https://github.com/Project-MONAI/MONAI#egg=MONAI
+```
+
 ## Training
 
 To train, run this file `/train.sh`
