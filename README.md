@@ -2,6 +2,10 @@
 
 ## Introduction
 
+
+https://covid-segmentation.grand-challenge.org/
+
+
 The COVID-19 pandemic has had a devastating impact on the health of individuals worldwide. The manifestation of the viral infection in the lung has been one of the earliest indicators of disease and may play an important role in the clinical management of patients. Ground glass opacities are the most common finding in COVID-19 lung computed tomography (CT) images, usually multifocal, bilateral and peripheral. However, the type, the size and distribution of the lung lesions may vary with the age of the patients and the severity or stage of the disease.
 
 The COVID-19-20 challenge will create the platform to evaluate emerging methods for the segmentation and quantification of lung lesions caused by SARS-CoV-2 infection from CT images. The images are multi-institutional, multi-national and originate from patients of different ages, gender and with variable disease severity.
