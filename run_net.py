@@ -90,7 +90,7 @@ def get_net():
         dropout=0.1,
     )
     if torch.cuda.device_count() > 1:
-        net = nn.DataParallel(model)
+        net = nn.DataParallel(net)
     return net
 
 
