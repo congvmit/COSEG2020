@@ -81,7 +81,6 @@ def get_xforms(mode="train", keys=("image", "label")):
 
 def get_net():
     """returns a unet model instance."""
-
     n_classes = 2
     net = monai.networks.nets.BasicUNet(
         dimensions=3,
@@ -90,6 +89,8 @@ def get_net():
         features=(32, 32, 64, 128, 256, 32),
         dropout=0.1,
     )
+    if torch.cuda.device_count() > 1:
+        net = nn.DataParallel(model)
     return net
 
 
@@ -126,7 +127,8 @@ class DiceCELoss(nn.Module):
 
 def train(args):
     """run a training pipeline."""
-
+    
+    save_args_to_file(args, 'runs/')
     images = sorted(glob.glob(os.path.join(data_folder, "*_ct.nii.gz")))
     labels = sorted(glob.glob(os.path.join(data_folder, "*_seg.nii.gz")))
     logging.info(f"training: image/label ({len(images)}) folder: {args.data_folder}")
@@ -250,7 +252,7 @@ def infer(data_folder=".", model_folder="runs", prediction_folder="output"):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = get_net().to(device)
-    net.load_state_dict(torch.load(ckpt, map_location=device))
+    net.load_state_dict(torch.load(ckpt, map_location=device)['net'])
     net.eval()
 
     image_folder = os.path.abspath(data_folder)
@@ -319,7 +321,9 @@ def get_args():
     parser.add_argument("--lr", default=0.01, type=float, help="learning rate")
     parser.add_argument("--gamma", default=0.5, type=float, help="lr scheduler gamma")
     parser.add_argument("--max_epochs", default=500, type=int, help="lr scheduler gamma")
-    parser.add_argument("--seed", default=0, type=int, help="random seed")                
+    parser.add_argument("--seed", default=0, type=int, help="random seed")   
+    parser.add_argument("--prediction_folder", default='output', type=str, help="random seed")   
+    
     args, _ = parser.parse_known_args()
     return args
 
@@ -331,7 +335,6 @@ if __name__ == "__main__":
     """
     
     args = get_args()
-    save_args_to_file(args, 'runs/')
     
     monai.config.print_config()
     monai.utils.set_determinism(seed=args.seed)
