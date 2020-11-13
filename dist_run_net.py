@@ -38,11 +38,14 @@ from monai.transforms import (
     ToTensord,
 )
 
+import torch.multiprocessing as mp
+import torch.distributed as dist
+
 
 from scheduler import BoundingExponentialLR
 from helpers import save_args_to_file
 
-def get_xforms(args, mode="train", keys=("image", "label")):
+def get_xforms(mode="train", keys=("image", "label")):
     """returns a composed transform for train/val/infer."""
 
     xforms = [
@@ -55,7 +58,7 @@ def get_xforms(args, mode="train", keys=("image", "label")):
     if mode == "train":
         xforms.extend(
             [
-                SpatialPadd(keys, spatial_size=(args.patch_size, args.patch_size, -1), mode="reflect"),  # ensure at least 192x192
+                SpatialPadd(keys, spatial_size=(192, 192, -1), mode="reflect"),  # ensure at least 192x192
                 RandAffined(
                     keys,
                     prob=0.15,
@@ -64,7 +67,7 @@ def get_xforms(args, mode="train", keys=("image", "label")):
                     mode=("bilinear", "nearest"),
                     as_tensor_output=False,
                 ),
-                RandCropByPosNegLabeld(keys, label_key=keys[1], spatial_size=(args.patch_size, args.patch_size, args.n_slice), num_samples=3),
+                RandCropByPosNegLabeld(keys, label_key=keys[1], spatial_size=(192, 192, 16), num_samples=3),
                 RandGaussianNoised(keys[0], prob=0.15, std=0.01),
                 RandFlipd(keys, spatial_axis=0, prob=0.5),
                 RandFlipd(keys, spatial_axis=1, prob=0.5),
@@ -80,9 +83,9 @@ def get_xforms(args, mode="train", keys=("image", "label")):
     return monai.transforms.Compose(xforms)
 
 
-def get_net(n_classes=2):
+def get_net():
     """returns a unet model instance."""
-#     n_classes = 2
+    n_classes = 2
     net = monai.networks.nets.BasicUNet(
         dimensions=3,
         in_channels=1,
@@ -95,11 +98,10 @@ def get_net(n_classes=2):
     return net
 
 
-def get_inferer(args, _mode=None):
+def get_inferer(_mode=None):
     """returns a sliding window inference instance."""
 
-    # patch_size = (192, 192, 16)
-    patch_size = (args.patch_size, args.patch_size, args.n_slice)
+    patch_size = (192, 192, 16)
     sw_batch_size, overlap = 2, 0.5
     inferer = monai.inferers.SlidingWindowInferer(
         roi_size=patch_size,
@@ -127,10 +129,34 @@ class DiceCELoss(nn.Module):
         return dice + cross_entropy
 
 
-def train(args):
+def train(gpu, args):
     """run a training pipeline."""
     
-    save_args_to_file(args, 'runs/')
+    
+    args.gpu = gpu
+    if args.gpu is not None:
+        print("Use GPU: {} for training".format(args.gpu))
+        
+    if args.distributed:
+        print('Setting up multiple GPUs')
+        if args.dist_url == "env://" and args.rank == -1:
+            args.rank = int(os.environ["RANK"])
+            
+        if args.multiprocessing_distributed:
+            # For multiprocessing distributed training, rank needs to be the
+            # global rank among all the processes
+            args.rank = args.rank * args.ngpus_per_node + gpu
+            print(args.rank)
+        dist.init_process_group(
+            backend=args.dist_backend,
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.rank,
+        )
+        print('Done!')
+    
+
+    #========================================
     images = sorted(glob.glob(os.path.join(args.data_folder, "*_ct.nii.gz")))
     labels = sorted(glob.glob(os.path.join(args.data_folder, "*_seg.nii.gz")))
     logging.info(f"training: image/label ({len(images)}) folder: {args.data_folder}")
@@ -151,21 +177,33 @@ def train(args):
 
     # create a training data loader
     logging.info(f"batch size {args.batch_size}")
-    train_transforms = get_xforms(args, "train", keys)
+    train_transforms = get_xforms("train", keys)
     train_ds = monai.data.CacheDataset(data=train_files, 
                                        transform=train_transforms, 
                                        cache_rate=args.cache_rate,
                                        num_workers=args.preprocessing_workers)
-    train_loader = monai.data.DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
+                                                                        num_replicas=args.world_size,
+                                                                        rank=args.rank
+        )
+        train_loader = monai.data.DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            sampler=train_sampler)    # 
+    else:
+        train_loader = monai.data.DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available())
+    
     # create a validation data loader
-    val_transforms = get_xforms(args, "val", keys)
+    val_transforms = get_xforms("val", keys)
     val_ds = monai.data.CacheDataset(data=val_files, transform=val_transforms)
     val_loader = monai.data.DataLoader(
         val_ds,
@@ -175,9 +213,24 @@ def train(args):
     )
 
     # create BasicUNet, DiceLoss and Adam optimizer
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = get_net(args.n_classes).to(device)
-    
+    if args.distributed:
+        print('Setting Up ')
+        torch.cuda.set_device(args.gpu)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        net.cuda(args.gpu)
+        args.batch_size = int(args.batch_size / ngpus_per_node)
+        args.val_batch_size = int(args.val_batch_size / ngpus_per_node)
+        args.num_workers = int(
+            (args.num_workers + ngpus_per_node - 1) / ngpus_per_node
+        )
+        net = torch.nn.parallel.DistributedDataParallel(
+            net, device_ids=[args.gpu]
+        )
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        net = get_net().to(device)
+        
     logging.info(f"epochs {args.max_epochs}, lr {args.lr}, momentum {args.momentum}")
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
 
@@ -199,6 +252,7 @@ def train(args):
         device = device,
         output_transform=lambda x: (pred_transform(x["pred"]), x["label"]),
     )
+    
         
     val_handlers = [
         ProgressBar(),
@@ -210,7 +264,7 @@ def train(args):
         device=device,
         val_data_loader=val_loader,
         network=net,
-        inferer=get_inferer(args),
+        inferer=get_inferer(),
         key_val_metric={"val_mean_dice": val_metric},
         val_handlers=val_handlers,
         amp=amp,
@@ -220,10 +274,7 @@ def train(args):
     train_handlers = [
         ValidationHandler(validator=evaluator, interval=1, epoch_level=True),
         StatsHandler(tag_name="train_loss", output_transform=lambda x: x["loss"]),
-        LrScheduleHandler(BoundingExponentialLR(opt, 
-                                                gamma=args.gamma, 
-                                                min_lr=args.min_lr, 
-                                                initial_lr=args.lr), 
+        LrScheduleHandler(BoundingExponentialLR(opt, gamma=args.gamma), 
                           print_lr=True, 
                           name='bounding_lr_scheduler', 
                           epoch_level=True,)
@@ -236,14 +287,14 @@ def train(args):
         network=net,
         optimizer=opt,
         loss_function=DiceCELoss(),
-        inferer=get_inferer(args),
+        inferer=get_inferer(),
         key_train_metric={'train_mean_dice': train_metric},
         train_handlers=train_handlers,
         amp=amp,
     )
     trainer.run()
 
-def infer(args, data_folder=".", model_folder="runs", prediction_folder="output"):
+def infer(data_folder=".", model_folder="runs", prediction_folder="output"):
     """
     run inference, the output folder will be "./output"
     """
@@ -265,7 +316,7 @@ def infer(args, data_folder=".", model_folder="runs", prediction_folder="output"
     infer_files = [{"image": img} for img in images]
 
     keys = ("image",)
-    infer_transforms = get_xforms(args, "infer", keys)
+    infer_transforms = get_xforms("infer", keys)
     infer_ds = monai.data.Dataset(data=infer_files, transform=infer_transforms)
     infer_loader = monai.data.DataLoader(
         infer_ds,
@@ -274,7 +325,7 @@ def infer(args, data_folder=".", model_folder="runs", prediction_folder="output"
         pin_memory=torch.cuda.is_available(),
     )
 
-    inferer = get_inferer(args)
+    inferer = get_inferer()
     saver = monai.data.NiftiSaver(output_dir=prediction_folder, mode="nearest")
     with torch.no_grad():
         for infer_data in infer_loader:
@@ -323,19 +374,55 @@ def get_args():
     parser.add_argument("--cache_rate", default=0.5, type=float, help="cache rate")
     parser.add_argument("--momentum", default=0.95, type=float, help="opt momentum")
     parser.add_argument("--lr", default=0.01, type=float, help="learning rate")
-    parser.add_argument("--min_lr", default=0.0001, type=float, help="learning rate")
-    parser.add_argument("--gamma", default=0.8, type=float, help="lr scheduler gamma")
-    parser.add_argument("--n_classes", default=2, type=int, help="a number of classes")
-    parser.add_argument("--n_slice", default=16, type=int, help="a number of input slice")
-    parser.add_argument("--patch_size", default=192, type=int, help="patch size")
+    parser.add_argument("--gamma", default=0.5, type=float, help="lr scheduler gamma")
     parser.add_argument("--max_epochs", default=500, type=int, help="lr scheduler gamma")
     parser.add_argument("--seed", default=0, type=int, help="random seed")   
     parser.add_argument("--prediction_folder", default='output', type=str, help="random seed")   
-
+    parser.add_argument("--gpu", default=None, type=str, help='GPU device to use')
+    # Distributed
+    parser.add_argument(
+        '--world-size',
+        default=-1,
+        type=int,
+        help='number of nodes for distributed training',
+    )
+    parser.add_argument(
+        '--rank',
+        default=-1,
+        type=int,
+        help='node rank for distributed training',
+    )
+    
+    parser.add_argument(
+        '--dist-url',
+        default='tcp://224.66.41.62:23456',
+        type=str,
+        help='url used to set up distributed training',
+    )
+    parser.add_argument(
+        '--dist-backend', default='nccl', type=str, help='distributed backend'
+    )
+    
+    parser.add_argument(
+        '--multiprocessing-distributed',
+        action='store_true',
+        help='Use multi-processing distributed training to launch '
+        'N processes per node, which has N GPUs. This is the '
+        'fastest way to use PyTorch for either single node or '
+        'multi node data parallel training',
+    )
+    
     args, _ = parser.parse_known_args()
     return args
 
+def setup_distributed_training(args):
+    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+    if args.dist_url == "env://" and args.world_size == -1:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+    args.ngpus_per_node = torch.cuda.device_count()
+    return args
 
+    
 if __name__ == "__main__":
     """
     Usage:
@@ -343,17 +430,29 @@ if __name__ == "__main__":
         python run_net.py infer --data_folder "COVID-19-20_v2/Validation" # run the inference pipeline
     """
     args = get_args()
-    
+    args = setup_distributed_training(args)
     
     monai.config.print_config()
     monai.utils.set_determinism(seed=args.seed)
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-
-    if args.mode == "train":       
-        train(args)
+    
+    if args.mode == "train":
+        save_args_to_file(args, 'runs/')
+        if args.multiprocessing_distributed:
+            # Since we have ngpus_per_node processes per node, the total world_size
+            # needs to be adjusted accordingly
+            args.world_size = args.ngpus_per_node * args.world_size
+            # Use torch.multiprocessing.spawn to launch distributed processes: the
+            # main_worker process function
+            print('> Distributed Training')
+            mp.spawn(train, nprocs=args.ngpus_per_node, args=(args, ))
+        else:
+            # Simply call main_worker function
+            print('> Single GPU Training')
+            train(args.gpu, args)        
         
     elif args.mode == "infer":
         data_folder = args.data_folder or os.path.join("COVID-19-20_v2", "Validation")
-        infer(args, data_folder=data_folder, model_folder=args.model_folder)
+        infer(data_folder=data_folder, model_folder=args.model_folder)
     else:
         raise ValueError("Unknown mode.")
